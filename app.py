@@ -1,14 +1,26 @@
+"""
+Suraksha Streamlit app — Gemini (google-genai) version.
+
+Requires:
+    pip install -U streamlit google-genai
+
+Set API key in `.streamlit/secrets.toml`:
+    GEMINI_API_KEY = "your_api_key_here"
+"""
+
 import streamlit as st
 import json
-from google import genai
 import logging
 import re
 import time
+import os
 from typing import Optional
+from google import genai
 
 # ================= CONFIG =================
-MODEL_NAME = "models/gemini-2.5-flash"
+MODEL_NAME = "gemini-3-flash-preview"   # matches Gemini quickstart docs
 MAX_API_RETRIES = 1
+TIMEOUT_BACKOFF = 1.0  # seconds
 
 # ================= LOGGING =================
 logger = logging.getLogger("Suraksha")
@@ -22,9 +34,9 @@ if not logger.handlers:
 def build_prompt(message_text: str) -> str:
     return f"""
 You are a professional financial fraud investigator.
-Analyze the message below for phishing, scams, or social engineering.
+Analyze the following message for phishing, scams, or social engineering.
 
-Return ONLY valid JSON with:
+Return a JSON object with exactly these keys:
 - Risk_Score (integer 0-100)
 - Risk_Level ("Low" | "Medium" | "High")
 - Reason (two concise sentences)
@@ -33,18 +45,28 @@ Message:
 \"\"\"{message_text}\"\"\"
 """
 
-# ================= JSON EXTRACTION =================
-def extract_json_from_text(text: str) -> Optional[dict]:
+# ================= JSON PARSING (robust) =================
+def parse_json_response(text: str) -> Optional[dict]:
+    """
+    Try to parse the response as JSON. If it fails, try to extract the first {...} block.
+    Return None if parsing fails.
+    """
+    if not text:
+        return None
+    # Prefer direct parse
     try:
         return json.loads(text)
     except Exception:
-        match = re.search(r"\{[\s\S]*\}", text)
-        if match:
-            try:
-                return json.loads(match.group(0))
-            except Exception:
-                return None
-        return None
+        pass
+
+    # Fallback: find first JSON object in the text (braced block)
+    match = re.search(r"\{[\s\S]*\}", text)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except Exception:
+            return None
+    return None
 
 # ================= HEURISTIC FALLBACK =================
 def heuristic_analysis(message_text: str) -> dict:
@@ -53,12 +75,12 @@ def heuristic_analysis(message_text: str) -> dict:
     urgency_terms = [
         "urgent", "immediately", "asap", "blocked", "suspended",
         "verify", "account locked", "otp", "one-time", "transfer",
-        "click here"
+        "click here", "verify now", "act now"
     ]
 
     suspicious_hits = sum(1 for w in urgency_terms if w in text)
-    has_money = any(w in text for w in ["rs", "₹", "rupees", "upi", "pay", "transfer"])
-    has_link = "http" in text or "www." in text
+    has_money = any(w in text for w in ["rs", "₹", "rupees", "upi", "pay", "transfer", "amount", "withdraw"])
+    has_link = "http" in text or "www." in text or ".com" in text
 
     if suspicious_hits >= 2 or has_link:
         score = 85
@@ -84,194 +106,156 @@ def heuristic_analysis(message_text: str) -> dict:
         "fallback": True
     }
 
-# ================= RETRY WRAPPER =================
-def with_retries(fn, max_attempts=1, backoff=0.6):
-    for attempt in range(max_attempts):
+# ================= RETRY HELPER =================
+def with_retries(fn, max_attempts=1, backoff=TIMEOUT_BACKOFF):
+    last_exc = None
+    for attempt in range(max_attempts + 1):
         try:
             return fn()
         except Exception as e:
-            logger.warning(f"Attempt {attempt+1} failed: {e}")
-            time.sleep(backoff * (2 ** attempt))
-    raise RuntimeError("Maximum retry attempts reached")
+            last_exc = e
+            logger.warning("Attempt %d failed: %s", attempt + 1, e)
+            if attempt < max_attempts:
+                time.sleep(backoff * (2 ** attempt))
+    raise last_exc
 
-# ================= AI ANALYSIS =================
-def analyze_message_impl(message_text: str, api_key: str) -> dict:
+# ================= AI ANALYSIS (google-genai) =================
+def analyze_message_impl(message_text: str, api_key: Optional[str]) -> dict:
+    """
+    Use google-genai Client to request structured JSON from Gemini.
+    Falls back to local heuristic on any failure.
+    """
+    if not api_key:
+        return heuristic_analysis(message_text)
+
+    # Initialize client explicitly with API key (client picks from env if None)
     client = genai.Client(api_key=api_key)
+
     prompt = build_prompt(message_text)
 
     def call():
+        # generate_content returns a response object with .text
         response = client.models.generate_content(
             model=MODEL_NAME,
             contents=prompt,
             config={
-                "response_mime_type": "application/json",
+                "response_mime_type": "application/json",  # ask for strict JSON
                 "temperature": 0.15,
                 "max_output_tokens": 512
             }
         )
 
-        text = getattr(response, "text", str(response))
-        parsed = extract_json_from_text(text)
-        if not parsed:
-            raise ValueError("Invalid JSON returned")
+        # Some SDKs place the text on response.text; ensure we handle both
+        text = getattr(response, "text", None) or getattr(response, "content", None) or str(response)
+        logger.info("LLM raw output:\n%s", text)
 
-        parsed["Risk_Score"] = max(0, min(100, int(parsed.get("Risk_Score", 0))))
-        parsed["Risk_Level"] = parsed.get("Risk_Level", "Low").capitalize()
-        parsed["Reason"] = parsed.get("Reason", "").strip()
+        parsed = parse_json_response(text)
+        if not parsed:
+            raise ValueError("Empty or Invalid JSON received from LLM")
+
+        # Normalize and validate fields
+        try:
+            parsed["Risk_Score"] = max(0, min(100, int(parsed.get("Risk_Score", 0))))
+        except Exception:
+            parsed["Risk_Score"] = 0
+
+        parsed["Risk_Level"] = str(parsed.get("Risk_Level", "Low")).capitalize()
+        parsed["Reason"] = str(parsed.get("Reason", "")).strip()
         parsed["fallback"] = False
         return parsed
 
     try:
-        return with_retries(call, MAX_API_RETRIES)
+        parsed = with_retries(call, max_attempts=MAX_API_RETRIES)
+        return parsed
     except Exception as e:
-        err = str(e).lower()
-        if "quota" in err or "429" in err:
-            logger.warning("Quota exceeded — using heuristic fallback")
-            return heuristic_analysis(message_text)
+        # If error mentions quota/429, we keep it logged
+        errstr = str(e).lower()
+        if "quota" in errstr or "429" in errstr:
+            logger.warning("Quota/Rate limit detected: %s", e)
+        else:
+            logger.error("AI Analysis Failed: %s", e)
         return heuristic_analysis(message_text)
 
-# ================= PAGE CONFIG =================
-st.set_page_config(
-    page_title="Suraksha",
-    page_icon="🛡️",
-    layout="centered"
-)
+# ================= STREAMLIT APP =================
+st.set_page_config(page_title="Suraksha", page_icon="🛡️", layout="centered")
 
-# ================= STYLES =================
-st.markdown("""
-<style>
-:root {
-    --bg: #ffffff;
-    --surface: #f6f7f8;
-    --border: #e1e3e6;
-    --text-primary: #111827;
-    --text-secondary: #4b5563;
+st.markdown("## SURAKSHA")
+st.caption("System for Unified Risk Assessment & Knowledge-based Security Heuristics & AI")
 
-    --danger: #b42318;
-    --warning: #b54708;
-    --success: #027a48;
-}
+if "history" not in st.session_state:
+    st.session_state.history = []
 
-.stApp {
-    background-color: var(--bg);
-    color: var(--text-primary);
-}
-
-.results-card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 20px;
-    margin-top: 24px;
-}
-
-.risk-badge {
-    padding: 4px 12px;
-    border-radius: 6px;
-    font-size: 0.75rem;
-    font-weight: 600;
-    letter-spacing: 0.04em;
-    display: inline-block;
-    margin-bottom: 8px;
-}
-
-.high { background: var(--danger); color: white; }
-.medium { background: var(--warning); color: white; }
-.low { background: var(--success); color: white; }
-
-button[kind="primary"] {
-    transition: transform 160ms cubic-bezier(.2,.8,.2,1),
-                box-shadow 160ms cubic-bezier(.2,.8,.2,1);
-}
-
-button[kind="primary"]:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 6px 14px rgba(0,0,0,0.08);
-}
-</style>
-""", unsafe_allow_html=True)
-
-# ================= MAIN APP =================
-def main():
-    st.markdown("## SURAKSHA")
-    st.caption(
-        "System for Unified Risk Assessment & Knowledge-based Security Heuristics & AI"
-    )
-
-    if "history" not in st.session_state:
-        st.session_state.history = []
-
+# Obtain API key from Streamlit secrets first, else environment
+api_key = None
+try:
     api_key = st.secrets.get("GEMINI_API_KEY")
+except Exception:
+    api_key = None
+if not api_key:
+    api_key = os.environ.get("GEMINI_API_KEY")
 
-    if not api_key:
-        st.info("LLM analysis disabled. Using local risk engine.")
+if not api_key:
+    st.info("No GEMINI_API_KEY found. The app will run in local (heuristic) mode only.")
 
-    message = st.text_area(
-        "Paste message for analysis",
-        height=160,
-        placeholder="Your account has been blocked. Verify immediately..."
-    )
+# UI input
+message = st.text_area("Paste message for analysis", height=160, placeholder="Your account has been blocked. Verify immediately...")
 
-    scan = st.button("Check message risk")
+if st.button("Check message risk") and message.strip():
+    with st.spinner("Analyzing message…"):
+        result = analyze_message_impl(message, api_key)
 
-    if scan and message.strip():
-        with st.spinner("Analyzing message…"):
-            result = analyze_message_impl(message, api_key) if api_key else heuristic_analysis(message)
+    # Save history
+    st.session_state.history.insert(0, {
+        "message": message,
+        "result": result,
+        "timestamp": int(time.time())
+    })
 
-        st.session_state.history.insert(0, {
-            "message": message,
-            "result": result,
-            "timestamp": int(time.time())
-        })
+    score = result["Risk_Score"]
+    level = result["Risk_Level"]
+    reason = result["Reason"]
+    fallback = result.get("fallback", False)
 
-        score = result["Risk_Score"]
-        level = result["Risk_Level"]
-        reason = result["Reason"]
+    st.markdown("### Recommended actions")
+    if level == "High":
+        st.error("Do not click links or share credentials. Contact your bank immediately.")
+    elif level == "Medium":
+        st.warning("Proceed cautiously. Verify sender through official channels.")
+    else:
+        st.success("No immediate threat detected. Remain vigilant.")
 
-        st.markdown("### Recommended actions")
-        if level == "High":
-            st.error("Do not click links or share credentials. Contact your bank immediately.")
-        elif level == "Medium":
-            st.warning("Proceed cautiously. Verify sender through official channels.")
-        else:
-            st.success("No immediate threat detected. Remain vigilant.")
-
-        st.markdown(f"""
-        <div class="results-card">
-            <div class="risk-badge {level.lower()}">RISK LEVEL: {level.upper()}</div>
-            <h3>Threat score: {score}/100</h3>
-            <p><strong>Analysis:</strong> {reason}</p>
-            {"<p><em>Local heuristic analysis used.</em></p>" if result.get("fallback") else ""}
+    st.markdown(f"""
+    <div style="background:#f6f7f8;border:1px solid #e1e3e6;border-radius:8px;padding:18px;margin-top:12px;">
+        <div style="display:inline-block;padding:6px 12px;border-radius:6px;font-weight:700;background:{'#b42318' if level=='High' else ('#b54708' if level=='Medium' else '#027a48')};color:white;">
+            {level.upper()}
         </div>
-        """, unsafe_allow_html=True)
+        <h3 style="margin-top:8px;">Threat score: {score}/100</h3>
+        <p><strong>Analysis:</strong> {reason}</p>
+        {("<p style='color:gray;font-size:0.9em'><em>⚠️ AI Unavailable — Local heuristic analysis used.</em></p>") if fallback else ""}
+    </div>
+    """, unsafe_allow_html=True)
 
-        st.markdown("### Confidence estimate")
-        st.progress(score / 100)
+    st.markdown("### Confidence estimate")
+    st.progress(score / 100)
 
-        report = {
-            "message": message,
-            "score": score,
-            "level": level,
-            "reason": reason,
-            "fallback": result.get("fallback", False),
-            "timestamp": int(time.time())
-        }
+    # Downloadable report
+    report = {
+        "message": message,
+        "score": score,
+        "level": level,
+        "reason": reason,
+        "fallback": fallback,
+        "timestamp": int(time.time())
+    }
+    st.download_button("Download report (JSON)", json.dumps(report, indent=2), file_name="suraksha_report.json", mime="application/json")
 
-        st.download_button(
-            "Download report (JSON)",
-            json.dumps(report, indent=2),
-            file_name="Suraksha_report.json",
-            mime="application/json"
-        )
-
-    with st.sidebar:
-        st.header("Recent analyses")
-        if not st.session_state.history:
-            st.caption("No scans yet.")
-        else:
-            for h in st.session_state.history[:10]:
-                ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(h["timestamp"]))
-                st.markdown(f"- **{h['result']['Risk_Level']} {h['result']['Risk_Score']}/100**  \n_{ts}_")
-
-if __name__ == "__main__":
-    main()
+# Sidebar: recent history
+with st.sidebar:
+    st.header("Recent analyses")
+    if not st.session_state.history:
+        st.caption("No scans yet.")
+    else:
+        for h in st.session_state.history[:10]:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(h["timestamp"]))
+            r = h["result"]
+            st.markdown(f"- **{r['Risk_Level']} {r['Risk_Score']}/100**  \n_{ts}_")
